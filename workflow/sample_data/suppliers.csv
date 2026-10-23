@@ -1,0 +1,7 @@
+supplier_id,name,category,status,owner,qualification_expiry,contact
+SUP-1001,远山办公设备有限公司,办公设备,active,李静,2027-03-31,linjing@example.com
+SUP-1002,华星科技服务有限公司,办公设备,pending,王磊,2026-12-31,wanglei@example.com
+SUP-1003,云帆信息技术有限公司,IT服务,active,陈晨,2027-06-30,chenchen@example.com
+SUP-1004,恒通物流有限公司,物流服务,suspended,赵敏,2026-09-30,zhaomin@example.com
+SUP-1005,新源材料有限公司,原材料,active,周涛,2028-01-31,zhoutao@example.com
+SUP-1006,北辰办公用品有限公司,办公设备,archived,孙悦,2025-12-31,sunyue@example.com

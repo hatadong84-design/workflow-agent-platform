@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+logs/
+workflow/logs/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
