@@ -69,7 +69,8 @@ def create_run(
 
 
 PUBLIC_FIELDS = (
-    "run_id", "task", "status", "error", "plan", "plan_approved", "plan_gate_reason",
+    "run_id", "task", "status", "error", "failed_node", "error_category",
+    "plan", "plan_approved", "plan_gate_reason",
     "plan_return_count", "step_policies", "tool_results", "source_excerpts",
     "review", "report", "support_review", "questions", "return_count",
     "approval_history", "llm_calls", "events",

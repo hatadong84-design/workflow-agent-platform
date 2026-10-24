@@ -1,0 +1,14 @@
+.git
+.venv
+venv
+__pycache__
+**/__pycache__
+**/*.py[cod]
+**/.env
+workflow/logs
+logs
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+workflow/tests
+workflow/eval

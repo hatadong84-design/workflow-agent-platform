@@ -19,6 +19,7 @@ from workflow.graph import (
     execute_plan,
 )
 from workflow.metrics import compute_metrics
+from workflow.llm import StructuredOutputError
 from workflow.retrieval import DOCS_DIR, _safe_doc_path, read_document, source_excerpts
 from workflow.schemas import PlannedToolStep, WorkflowPlan
 from workflow.support import evaluate_claim, evaluate_report_support
@@ -47,6 +48,32 @@ class EchoInput(BaseModel):
 
 
 class PlatformUnitTests(unittest.TestCase):
+    def test_planner_repairs_structured_output_once_and_aggregates_usage(self):
+        registry = default_registry()
+        valid_plan = agents.mock_plan("整理采购报销材料", registry)[0]
+        failed_usage = {"role": "Planner", "elapsed_ms": 15, "input_tokens": 10, "output_tokens": 2, "total_tokens": 12, "outcome": "error"}
+        success_usage = {"role": "Planner", "elapsed_ms": 20, "input_tokens": 11, "output_tokens": 3, "total_tokens": 14, "outcome": "success"}
+        with patch("workflow.agents.invoke_structured", side_effect=[
+            StructuredOutputError("bad schema", failed_usage),
+            (valid_plan, success_usage),
+        ]) as invoke:
+            _, usage = agents.make_plan("整理采购报销材料", registry)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(usage["attempt_count"], 2)
+        self.assertEqual(usage["total_tokens"], 26)
+        self.assertEqual(usage["outcome"], "success")
+
+    def test_planner_exhausted_repair_retains_failed_attempt_usage(self):
+        registry = default_registry()
+        call_usage = {"role": "Planner", "elapsed_ms": 7, "input_tokens": 4, "output_tokens": 1, "total_tokens": 5, "outcome": "error"}
+        error = StructuredOutputError("invalid structured response", call_usage)
+        with patch("workflow.agents.invoke_structured", side_effect=[error, error]):
+            with self.assertRaises(agents.AgentInvocationError) as caught:
+                agents.make_plan("整理采购报销材料", registry)
+        self.assertEqual(caught.exception.error_category, "structured_output")
+        self.assertEqual(caught.exception.usage["attempt_count"], 2)
+        self.assertEqual(caught.exception.usage["total_tokens"], 10)
+
     def test_plan_rejects_cycles_and_unknown_dependencies(self):
         with self.assertRaises(ValidationError):
             WorkflowPlan(
@@ -503,6 +530,43 @@ class WorkflowIntegrationTests(unittest.TestCase):
     def tearDown(self):
         self.mock_env.stop()
         self.saver_context.__exit__(None, None, None)
+
+    def test_planner_failure_is_checkpointed_with_stage_and_safe_event(self):
+        config = {"configurable": {"thread_id": "planner-failed"}}
+        failure = TimeoutError("authorization: Bearer sk-abcdefgh12345678 timed out")
+        with patch("workflow.graph.agents.mock_plan", side_effect=failure):
+            self.graph.invoke({"run_id": "planner-failed", "task": "整理报销资料"}, config=config)
+        state = self.graph.get_state(config).values
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["failed_node"], "planner")
+        self.assertEqual(state["error_category"], "timeout")
+        self.assertNotIn("sk-abcdefgh12345678", state["error"])
+        self.assertEqual(state["events"][-1]["kind"], "agent_failed")
+        self.assertEqual(state["events"][-1]["stage"], "plan")
+
+    def test_review_failure_ends_before_human_approval(self):
+        config = {"configurable": {"thread_id": "review-failed"}}
+        with patch("workflow.graph.agents.mock_review", side_effect=ValueError("malformed review")):
+            self.graph.invoke({"run_id": "review-failed", "task": "整理报销资料"}, config=config)
+        state = self.graph.get_state(config).values
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["failed_node"], "review_agent")
+        self.assertNotIn("review", state)
+        self.assertNotIn("review_completed", [event["kind"] for event in state["events"]])
+        self.assertNotEqual(state.get("approval_stage"), "report")
+
+    def test_report_failure_does_not_create_successful_report(self):
+        config = {"configurable": {"thread_id": "report-failed"}}
+        self.graph.invoke({"run_id": "report-failed", "task": "整理报销资料"}, config=config)
+        self.assertEqual(self.graph.get_state(config).values["status"], "awaiting_human")
+        with patch("workflow.graph.agents.mock_report", side_effect=TimeoutError("model timed out")):
+            self.graph.invoke(Command(resume={"decision": "approve", "comment": "确认"}), config=config)
+        state = self.graph.get_state(config).values
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["failed_node"], "report_agent")
+        self.assertEqual(state["error_category"], "timeout")
+        self.assertNotIn("report", state)
+        self.assertNotIn("report_completed", [event["kind"] for event in state["events"]])
 
     def test_return_replans_reuses_cached_tools_then_approval_completes(self):
         config = {"configurable": {"thread_id": "full-cycle"}}

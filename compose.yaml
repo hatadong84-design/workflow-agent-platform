@@ -1,0 +1,37 @@
+services:
+  api:
+    build: .
+    env_file:
+      - workflow/.env
+    environment:
+      WORKFLOW_CHECKPOINT_PATH: /data/workflow_platform_checkpoints.sqlite
+      WORKFLOW_LLM_LOG: /data/llm_calls.jsonl
+    command: ["uvicorn", "workflow.api:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "127.0.0.1:${WORKFLOW_API_PORT:-8001}:8001"
+    volumes:
+      - workflow-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    env_file:
+      - workflow/.env
+    environment:
+      WORKFLOW_API_URL: http://api:8001
+    command: ["streamlit", "run", "workflow/dashboard.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.gatherUsageStats=false"]
+    ports:
+      - "127.0.0.1:${WORKFLOW_DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  workflow-data:

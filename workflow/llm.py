@@ -18,6 +18,20 @@ _log_lock = threading.Lock()
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
+class StructuredOutputError(ValueError):
+    def __init__(self, message: str, usage: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.usage = usage
+        self.error_category = "structured_output"
+
+
+class LLMProviderError(RuntimeError):
+    def __init__(self, message: str, usage: dict[str, Any], error_category: str) -> None:
+        super().__init__(message)
+        self.usage = usage
+        self.error_category = error_category
+
+
 @lru_cache(maxsize=1)
 def get_chat_model():
     provider = os.getenv("WORKFLOW_LLM_PROVIDER", "siliconflow").strip().lower()
@@ -27,7 +41,7 @@ def get_chat_model():
         if not os.getenv("SILICONFLOW_API_KEY"):
             raise RuntimeError("缺少 SILICONFLOW_API_KEY；请在项目根目录 .env 中配置")
         return ChatOpenAI(
-            model=os.getenv("WORKFLOW_CHAT_MODEL", "deepseek-ai/DeepSeek-V3.2"),
+            model=os.getenv("WORKFLOW_CHAT_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash"),
             base_url=os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
             api_key=os.getenv("SILICONFLOW_API_KEY"),
             temperature=0,
@@ -45,7 +59,7 @@ def get_chat_model():
 def _model_label() -> str:
     provider = os.getenv("WORKFLOW_LLM_PROVIDER", "siliconflow").strip().lower()
     if provider in {"siliconflow", "openai_compatible"}:
-        return f"siliconflow:{os.getenv('WORKFLOW_CHAT_MODEL', 'deepseek-ai/DeepSeek-V3.2')}"
+        return f"siliconflow:{os.getenv('WORKFLOW_CHAT_MODEL', 'deepseek-ai/DeepSeek-V4.1-Flash')}"
     return f"dashscope:{os.getenv('WORKFLOW_CHAT_MODEL', 'qwen-plus')}"
 
 
@@ -69,10 +83,12 @@ def invoke_structured(
 ) -> tuple[SchemaT, dict[str, int | float | None]]:
     started = time.perf_counter()
     raw: BaseMessage | None = None
+    received_response = False
     try:
         result = get_chat_model().with_structured_output(schema, include_raw=True).invoke(
             [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         )
+        received_response = True
         raw = result.get("raw")
         parsed = result.get("parsed")
         if result.get("parsing_error"):
@@ -85,8 +101,26 @@ def invoke_structured(
             output = schema.model_validate(parsed)
         return output, _record_usage(role, raw, started, "success")
     except Exception as exc:
-        _record_usage(role, raw, started, "error", str(exc))
-        raise
+        usage = _record_usage(role, raw, started, "error", str(exc))
+        message = _safe_error(str(exc))
+        if received_response and isinstance(exc, (ValueError, TypeError)):
+            raise StructuredOutputError(message, usage) from exc
+        category = (
+            "timeout"
+            if isinstance(exc, TimeoutError)
+            or "timeout" in type(exc).__name__.lower()
+            or "timed out" in str(exc).lower()
+            else "provider_or_system"
+        )
+        raise LLMProviderError(message, usage, category) from exc
+
+
+def _safe_error(message: str) -> str:
+    import re
+
+    message = re.sub(r"(?i)(api[_-]?key|authorization|bearer)\s*[:=]?\s*\S+", r"\1=[REDACTED]", message)
+    message = re.sub(r"(?i)sk-[A-Za-z0-9_-]{8,}", "[REDACTED]", message)
+    return message[:400]
 
 
 def _record_usage(
@@ -115,7 +149,7 @@ def _record_usage(
         "outcome": outcome,
     }
     if error:
-        record["error"] = error[:400]
+        record["error"] = _safe_error(error)
 
     log_path = Path(os.getenv("WORKFLOW_LLM_LOG", PROJECT_DIR / "logs" / "workflow_llm_calls.jsonl"))
     log_path.parent.mkdir(parents=True, exist_ok=True)

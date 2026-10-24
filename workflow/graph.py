@@ -51,6 +51,8 @@ class WorkflowState(TypedDict, total=False):
     task: str
     status: str
     error: str
+    failed_node: str
+    error_category: str
     plan: dict[str, Any]
     plan_approved: bool
     plan_gate_reason: str
@@ -207,7 +209,11 @@ def build_graph(checkpointer, registry: ToolRegistry | None = None):
         {"planner": "planner", "data_agent": "data_agent", "end": END},
     )
     builder.add_conditional_edges("data_agent", route_after_data, {"review_agent": "review_agent", "end": END})
-    builder.add_edge("review_agent", "human_approval")
+    builder.add_conditional_edges(
+        "review_agent",
+        route_after_review,
+        {"human_approval": "human_approval", "end": END},
+    )
     builder.add_conditional_edges(
         "human_approval",
         route_after_approval,
@@ -236,7 +242,10 @@ def initialize_node(state: WorkflowState) -> dict[str, Any]:
 
 
 def planner_node(state: WorkflowState, registry: ToolRegistry) -> dict[str, Any]:
-    plan, usage = _plan_agent(state["task"], registry, state.get("previous_feedback", ""))
+    try:
+        plan, usage = _plan_agent(state["task"], registry, state.get("previous_feedback", ""))
+    except Exception as exc:
+        return _agent_failure(state, "planner", "plan", exc)
     reason = plan_approval_reason(plan, registry, state["task"])
     step_policies = {}
     for step in plan.steps:
@@ -347,7 +356,9 @@ def data_agent_node(state: WorkflowState, registry: ToolRegistry) -> dict[str, A
     except ExecutionHalt as exc:
         return {
             "status": "failed",
-            "error": str(exc)[:1000],
+            "failed_node": "data_agent",
+            "error_category": "tool_execution",
+            "error": _safe_error_summary(exc),
             "tool_results": exc.results,
             "tool_cache": exc.cache,
             "source_excerpts": _current_excerpts(state["plan"], exc.results),
@@ -356,7 +367,9 @@ def data_agent_node(state: WorkflowState, registry: ToolRegistry) -> dict[str, A
     except Exception as exc:
         return {
             "status": "failed",
-            "error": str(exc)[:1000],
+            "failed_node": "data_agent",
+            "error_category": "provider_or_system",
+            "error": _safe_error_summary(exc),
             "events": [_event("tool_failed", "failed", str(exc))],
         }
 
@@ -365,17 +378,57 @@ def route_after_data(state: WorkflowState) -> str:
     return "end" if state.get("status") == "failed" else "review_agent"
 
 
-def review_agent_node(state: WorkflowState) -> dict[str, Any]:
-    if agents.mock_agents_enabled():
-        review, usage = agents.mock_review(
-            state["task"], state["plan"], state.get("tool_results", {}),
-            state.get("source_excerpts", {}), state.get("previous_feedback", ""),
-        )
+def _safe_error_summary(exc: Exception) -> str:
+    import re
+
+    message = str(exc) or type(exc).__name__
+    message = re.sub(r"(?i)(api[_-]?key|authorization|bearer)\s*[:=]?\s*\S+", r"\1=[REDACTED]", message)
+    message = re.sub(r"(?i)sk-[A-Za-z0-9_-]{8,}", "[REDACTED]", message)
+    return message[:400]
+
+
+def _agent_failure(state: WorkflowState, node: str, stage: str, exc: Exception) -> dict[str, Any]:
+    if getattr(exc, "error_category", None):
+        category = exc.error_category
+    elif isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower():
+        category = "timeout"
+    elif isinstance(exc, ValueError):
+        category = "structured_output"
     else:
-        review, usage = agents.review_materials(
-            state["task"], state["plan"], state.get("tool_results", {}),
-            state.get("source_excerpts", {}), state.get("previous_feedback", ""),
-        )
+        category = "provider_or_system"
+    usage = getattr(exc, "usage", None)
+    llm_calls = [*state.get("llm_calls", [])]
+    if isinstance(usage, dict):
+        llm_calls.append(usage)
+    message = _safe_error_summary(exc)
+    return {
+        "status": "failed",
+        "failed_node": node,
+        "error_category": category,
+        "error": f"{stage}阶段失败（{category}）：{message}",
+        "llm_calls": llm_calls,
+        "events": [_event(
+            "agent_failed", "failed", message,
+            agent=node, stage=stage, error_category=category,
+            attempts=(usage or {}).get("attempt_count", 1),
+        )],
+    }
+
+
+def review_agent_node(state: WorkflowState) -> dict[str, Any]:
+    try:
+        if agents.mock_agents_enabled():
+            review, usage = agents.mock_review(
+                state["task"], state["plan"], state.get("tool_results", {}),
+                state.get("source_excerpts", {}), state.get("previous_feedback", ""),
+            )
+        else:
+            review, usage = agents.review_materials(
+                state["task"], state["plan"], state.get("tool_results", {}),
+                state.get("source_excerpts", {}), state.get("previous_feedback", ""),
+            )
+    except Exception as exc:
+        return _agent_failure(state, "review_agent", "review", exc)
     review_dict = review.model_dump()
     return {
         "review": review_dict,
@@ -435,15 +488,22 @@ def route_after_approval(state: WorkflowState) -> str:
     return "planner"
 
 
+def route_after_review(state: WorkflowState) -> str:
+    return "end" if state.get("status") == "failed" else "human_approval"
+
+
 def report_agent_node(state: WorkflowState) -> dict[str, Any]:
-    if agents.mock_agents_enabled():
-        report, usage = agents.mock_report(
-            state["task"], state["review"], state.get("source_excerpts", {})
-        )
-    else:
-        report, usage = agents.write_report(
-            state["task"], state["review"], state.get("source_excerpts", {})
-        )
+    try:
+        if agents.mock_agents_enabled():
+            report, usage = agents.mock_report(
+                state["task"], state["review"], state.get("source_excerpts", {})
+            )
+        else:
+            report, usage = agents.write_report(
+                state["task"], state["review"], state.get("source_excerpts", {})
+            )
+    except Exception as exc:
+        return _agent_failure(state, "report_agent", "report", exc)
     report_dict = report.model_dump()
     support_review = evaluate_report_support(report_dict, state.get("source_excerpts", {}))
     detail = "报告生成且来源 ID 校验通过"
@@ -480,8 +540,9 @@ def _mark_failed(graph, config: dict[str, Any], exc: Exception) -> None:
             config,
             {
                 "status": "failed",
-                "error": str(exc)[:1000],
-                "events": [_event("workflow_failed", "failed", str(exc))],
+                "error_category": "workflow_fallback",
+                "error": _safe_error_summary(exc),
+                "events": [_event("workflow_failed", "failed", _safe_error_summary(exc))],
             },
         )
     except Exception:

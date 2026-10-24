@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .llm import invoke_structured
@@ -35,6 +36,52 @@ def _usage_empty(role: str = "mock", outcome: str = "mock") -> dict[str, Any]:
         "total_tokens": None,
         "outcome": outcome,
     }
+
+
+class AgentInvocationError(ValueError):
+    def __init__(self, message: str, usage: dict[str, Any], category: str) -> None:
+        super().__init__(message)
+        self.usage = usage
+        self.error_category = category
+
+
+def _attempt_usage(role: str, exc: Exception, usage: dict[str, Any] | None) -> dict[str, Any]:
+    entry = dict(getattr(exc, "usage", None) or usage or _usage_empty(role, "error"))
+    entry["role"] = role
+    entry["outcome"] = "error"
+    message = str(exc)
+    message = re.sub(r"(?i)(api[_-]?key|authorization|bearer)\s*[:=]?\s*\S+", r"\1=[REDACTED]", message)
+    message = re.sub(r"(?i)sk-[A-Za-z0-9_-]{8,}", "[REDACTED]", message)
+    entry["error"] = message[:300]
+    return entry
+
+
+def _combined_usage(role: str, attempts: list[dict[str, Any]], outcome: str) -> dict[str, Any]:
+    totals = {
+        key: sum(int(item[key]) for item in attempts if isinstance(item.get(key), (int, float)))
+        if any(isinstance(item.get(key), (int, float)) for item in attempts)
+        else None
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    }
+    return {
+        "role": role,
+        "elapsed_ms": round(sum(float(item.get("elapsed_ms") or 0) for item in attempts), 1),
+        **totals,
+        "outcome": outcome,
+        "attempt_count": len(attempts),
+        "attempts": attempts,
+    }
+
+
+def _error_category(exc: Exception) -> str:
+    explicit = getattr(exc, "error_category", None)
+    if explicit:
+        return explicit
+    if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower():
+        return "timeout"
+    if isinstance(exc, ValueError):
+        return "structured_output"
+    return "provider_or_system"
 
 
 def _resolve_references(value: Any, dependency_results: dict[str, dict]) -> Any:
@@ -142,6 +189,7 @@ def make_plan(
         ensure_ascii=False,
     )
     last_error: Exception | None = None
+    attempt_usages: list[dict[str, Any]] = []
     for attempt in range(2):
         retry_prompt = user_prompt
         if attempt:
@@ -152,14 +200,22 @@ def make_plan(
                 },
                 ensure_ascii=False,
             )
+        usage = None
         try:
             plan, usage = invoke_structured("Planner", WorkflowPlan, PLANNER_SYSTEM, retry_prompt)
             _validate_plan(plan, registry)
-            return plan, usage
+            attempt_usages.append(usage)
+            return plan, _combined_usage("Planner", attempt_usages, "success")
         except ValueError as exc:
+            attempt_usages.append(_attempt_usage("Planner", exc, usage))
             last_error = exc
+        except Exception as exc:
+            attempt_usages.append(_attempt_usage("Planner", exc, usage))
+            combined = _combined_usage("Planner", attempt_usages, "error")
+            raise AgentInvocationError(str(exc), combined, _error_category(exc)) from exc
     assert last_error is not None
-    raise last_error
+    combined = _combined_usage("Planner", attempt_usages, "error")
+    raise AgentInvocationError(str(last_error), combined, "structured_output") from last_error
 
 
 def review_materials(
@@ -182,6 +238,7 @@ def review_materials(
     prompt = json.dumps(base_request, ensure_ascii=False)
     valid_ids = set(sources)
     last_error: Exception | None = None
+    attempt_usages: list[dict[str, Any]] = []
     for attempt in range(2):
         if attempt:
             prompt = json.dumps(
@@ -194,6 +251,7 @@ def review_materials(
                 },
                 ensure_ascii=False,
             )
+        usage = None
         try:
             review, usage = invoke_structured("Review Agent", ReviewResult, REVIEW_SYSTEM, prompt)
             for finding in review.findings:
@@ -202,11 +260,18 @@ def review_materials(
                     raise ValueError(f"Review Agent 引用了未知来源：{sorted(unknown)}")
                 if finding.supported and not finding.source_ids:
                     raise ValueError("有来源支持的审核结论必须带来源 ID")
-            return review, usage
+            attempt_usages.append(usage)
+            return review, _combined_usage("Review Agent", attempt_usages, "success")
         except ValueError as exc:
+            attempt_usages.append(_attempt_usage("Review Agent", exc, usage))
             last_error = exc
+        except Exception as exc:
+            attempt_usages.append(_attempt_usage("Review Agent", exc, usage))
+            combined = _combined_usage("Review Agent", attempt_usages, "error")
+            raise AgentInvocationError(str(exc), combined, _error_category(exc)) from exc
     assert last_error is not None
-    raise last_error
+    combined = _combined_usage("Review Agent", attempt_usages, "error")
+    raise AgentInvocationError(str(last_error), combined, "structured_output") from last_error
 
 
 def write_report(
@@ -243,6 +308,7 @@ def write_report(
     prompt = json.dumps(base_request, ensure_ascii=False)
     valid = set(sources)
     last_error: Exception | None = None
+    attempt_usages: list[dict[str, Any]] = []
     for attempt in range(2):
         if attempt:
             prompt = json.dumps(
@@ -256,6 +322,7 @@ def write_report(
                 },
                 ensure_ascii=False,
             )
+        usage = None
         try:
             report, usage = invoke_structured("Report Agent", ReportNarrative, REPORT_SYSTEM, prompt)
             if supported_ids and (
@@ -268,11 +335,18 @@ def write_report(
                     raise ValueError("报告声明引用了不存在的来源 ID")
                 if not set(claim.source_ids).issubset(supported_ids):
                     raise ValueError("报告声明引用了未通过审核的来源")
-            return report, usage
+            attempt_usages.append(usage)
+            return report, _combined_usage("Report Agent", attempt_usages, "success")
         except ValueError as exc:
+            attempt_usages.append(_attempt_usage("Report Agent", exc, usage))
             last_error = exc
+        except Exception as exc:
+            attempt_usages.append(_attempt_usage("Report Agent", exc, usage))
+            combined = _combined_usage("Report Agent", attempt_usages, "error")
+            raise AgentInvocationError(str(exc), combined, _error_category(exc)) from exc
     assert last_error is not None
-    raise last_error
+    combined = _combined_usage("Report Agent", attempt_usages, "error")
+    raise AgentInvocationError(str(last_error), combined, "structured_output") from last_error
 
 
 def mock_plan(task: str, registry: ToolRegistry, previous_feedback: str = "") -> tuple[WorkflowPlan, dict]:

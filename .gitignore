@@ -16,6 +16,9 @@ workflow/logs/
 *.sqlite-shm
 *.sqlite-wal
 
+# Personal notes
+项目优化方案.md
+
 # OS / editor
 .DS_Store
 Thumbs.db

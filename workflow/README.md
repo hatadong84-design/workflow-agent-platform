@@ -1,6 +1,27 @@
-# 企业流程自动化多 Agent 平台
+# 企业流程自动化工作流平台
 
-轻量级工作流平台示例：用户以自然语言提交任务，Planner 从代码注册的只读、幂等工具中规划依赖 DAG（最多 6 步），执行前经过确定性策略检查和计划审批门，Data Agent 拓扑执行，Review Agent 检查资料并等待报告门确认，Report Agent 生成带来源的报告。
+> **一句话说明：**把分散在结构化清单和制度文档里的信息串成一条可审核的业务流程，输出有来源的核验材料和待人工确认事项。
+
+这是一个面向 AI 应用开发岗位的本地演示原型。主场景是**供应商准入核验**：查询样例供应商清单，按记录类别检索准入制度，读取匹配条款，再由 Review Agent 检查依据和缺口，最后由人工确认是否生成报告。
+
+**它能做什么：**展示自然语言任务规划、工具依赖传值、只读数据查询、审批前置、退回重规划、来源引用和执行追踪。**它不会做什么：**不连接真实供应商系统，不批准供应商，也不修改企业业务数据。
+
+## 演示截图
+
+![场景入口：选择供应商准入核验并查看输入、产出和边界](assets/01-home.png)
+
+![供应商核验：展示流程状态、Planner 计划和本地登记结果](assets/02-supplier-run.png)
+
+第二张截图来自 mock 流程运行，仅用于展示界面与状态流转，不代表真实模型输出质量。
+
+## 一分钟演示
+
+1. 按下方说明启动 FastAPI 和 Streamlit，打开 `http://127.0.0.1:8501`。
+2. 选择“供应商准入核验”，使用预填任务提交。
+3. 计划门展示审批原因和工具计划；批准后，界面显示供应商登记查询、制度搜索与条款读取三个步骤。
+4. Review 展示来源支持情况和待确认问题。人工确认后生成报告，可以展开来源摘录并下载审计包。
+
+供应商清单与制度来自本地样例文件。页面上的事实、来源和状态来自本次运行；不会展示未经测量的“节省时间”或“提升效率”数字。
 
 典型多步编排：`query_supplier_registry` 查询供应商登记记录，将记录中的类别通过 `$ref` 传给 `search_local_docs` 检索准入制度，再读取匹配文档，最终报告同时引用清单记录和制度文档的来源 ID。
 
@@ -51,31 +72,45 @@ flowchart LR
 - 上游步骤因空结果被跳过时，依赖它的后续步骤也标记为跳过，由 Review 说明资料缺口，不会让后续 `$ref` 解析失败中断流程。
 - 工具结果按规范化后的 `(工具名, 参数)` 缓存。人工退回触发重新规划时，完全相同的只读调用复用成功结果。
 - 状态：`running` 表示执行中；`awaiting_plan_approval` 表示等待计划审批；`awaiting_human` 表示等待报告审批；`succeeded` 表示报告完成；`failed` 表示工具或系统出错；`terminated` 表示退回达到上限。计划门和报告门各最多退回两次。
+- Planner、Review、Report 失败时记录 `failed_node`、`error_category`、脱敏错误摘要和 `agent_failed` 事件；失败状态保存在 checkpoint 中，不进入后续审批或伪造成功报告。结构化输出修复最多一次，失败调用耗时与可用 token 用量保留在运行记录中。
 - SQLite LangGraph checkpointer 是状态来源；FastAPI `BackgroundTasks` 用于本地演示，不保证进程退出后后台任务继续运行。
 
 ## 安装和启动
 
-从仓库根目录执行（需要 Python 3.11+）：
+本项目使用本地样例供应商和制度资料；演示不会连接真实企业系统，也不会执行写操作。首次启动默认使用 mock Agent，不需要模型密钥。
+
+### 本机一键启动（Windows）
+
+在仓库根目录运行（需要 Python 3.11+）：
 
 ```powershell
-python -m pip install -r .\workflow\requirements.txt
-python -m workflow.api
+Set-ExecutionPolicy -Scope Process Bypass
+.\start.ps1
 ```
 
-另开一个终端启动界面：
+脚本仅在 `workflow/.env` 不存在时从示例复制，不覆盖现有配置；首次运行会创建 `.venv` 并安装依赖。首次启动后打开 `http://127.0.0.1:8501`。停止服务运行 `.stop.ps1`，日志位于 `workflow/logs`。
+
+### Docker Compose
+
+需要安装并启动 Docker Desktop。在仓库根目录执行：
 
 ```powershell
-python -m streamlit run .\workflow\dashboard.py
+Copy-Item .\workflow\.env.example .\workflow\.env
+docker compose up --build -d
 ```
 
-API 默认 `http://127.0.0.1:8001`，Streamlit 默认 `http://127.0.0.1:8501`。真实模型在 `workflow/.env` 配置：默认 provider 为 SiliconFlow，需要 `SILICONFLOW_API_KEY`；切回通义则设置 `WORKFLOW_LLM_PROVIDER=dashscope` 并提供 `DASHSCOPE_API_KEY`。`WORKFLOW_CHAT_MODEL` 选择模型，`WORKFLOW_LLM_TIMEOUT`（秒，默认 120）和 `WORKFLOW_LLM_MAX_RETRIES`（默认 1）控制超时与重试。默认 checkpoint 写入 `workflow/logs/workflow_platform_checkpoints.sqlite`，可通过 `WORKFLOW_CHECKPOINT_PATH` 覆盖。
+界面地址为 `http://127.0.0.1:8501`，API 为 `http://127.0.0.1:8001`。停止容器运行 `docker compose down`；同时删除 checkpoint 和模型调用日志运行 `docker compose down -v`。
+
+### 配置真实模型
+
+编辑 `workflow/.env`：设置 `WORKFLOW_MOCK_LLM=0` 并填写 `SILICONFLOW_API_KEY`。默认 provider 为 SiliconFlow，模型为 `deepseek-ai/DeepSeek-V4.1-Flash`；`WORKFLOW_LLM_TIMEOUT`（秒，默认 120）和 `WORKFLOW_LLM_MAX_RETRIES`（默认 1）控制请求超时与提供商重试。结构化输出解析或 schema 校验失败时，每个 Planner/Review/Report 调用最多尝试两次。真实模型调用可能产生费用。
 
 ## API
 
 - `GET /health`：健康状态。
 - `GET /tools`：注册工具、输入 schema 和治理策略字段。
 - `POST /runs`：JSON `{"task":"整理采购申请材料并列出待确认问题"}`，返回 `run_id`。
-- `GET /runs/{run_id}`：读取计划、策略、步骤结果、来源摘录、审核、报告、支持度检查、审批历史和追加事件；`approval_stage` 为 `plan`、`report` 或 `null`。
+- `GET /runs/{run_id}`：读取计划、策略、步骤结果、来源摘录、审核、报告、支持度检查、审批历史和追加事件；`approval_stage` 为 `plan`、`report` 或 `null`，失败时附带 `failed_node` 和 `error_category`。
 - `POST /runs/{run_id}/approval`：提交 JSON `{"decision":"approve|return","comment":"..."}`；同时用于计划门和报告门。
 - `GET /runs/{run_id}/audit/verify`：按顺序重算哈希链，返回 `valid`、`events_checked`、`root_hash`、`broken_at`。
 - `GET /runs/{run_id}/metrics`：从事件和 `llm_calls` 现算工具调用、重试、缓存命中率、各节点耗时、token 用量和审计状态。
